@@ -1,0 +1,39 @@
+# 真实配置（含账号/路径/密钥）绝不提交
+config.json
+*.local.json
+.env
+.env.*
+secrets.*
+secure_keys.py
+
+# 浏览器登录态 / Cookie / 缓存
+*_profile/
+*profile/
+Cookies
+Local State
+*.db
+*.sqlite
+*.log
+
+# 正文与平台数据（体积大且含作品内容，按需决定是否提交）
+manuscript/
+chapters/
+发布记录/
+审核记录/
+审核记录*/
+*.docx
+*.pdf
+*.epub
+
+# 系统/编辑器
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+__pycache__/
+*.pyc
+*.tmp
+
+# Obsidian 私有库可整体忽略（只提交 templates/obsidian-vault/ 示例）
+vault/
+.myvault/

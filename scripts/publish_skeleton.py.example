@@ -1,0 +1,323 @@
+# -*- coding: utf-8 -*-
+"""【示例脚本，需改配置】网文逐章发布骨架（脱敏版）。
+用途：演示"只读核对 → 逐章提交 → 回读核验 → 写回记录"的发布流程。
+使用前：1) 把 YOUR_* 占位符改成你自己的；2) 确认你所用平台的选择器与流程；
+3) 先用一本测试书验证，不要直接跑正式作品。
+注意：平台规则/选择器会变，本脚本不保证直接可用，详见 docs/07、docs/10。
+"""
+import sys, os, json, time, re, traceback
+from pathlib import Path
+from playwright.sync_api import sync_playwright
+
+V = Path(r'YOUR_PROJECT_ROOT')
+CH_DIR = V / '发布记录' / '发布用章节'
+PROGRESS = V / '发布记录' / 'ds_progress.jsonl'
+LOG = V / '发布记录' / 'ds_run.log'
+PROFILE = Path(r'YOUR_BROWSER_PROFILE_DIR')
+CHROME = r'YOUR_CHROME_PATH'
+
+BOOK_ID = 'YOUR_BOOK_ID'          # 你的作品ID（示例：平台已有前38章时续发）
+OLD_ID = 'OTHER_BOOK_ID_DO_NOT_TOUCH'            # 另一部作品ID：绝对禁止触碰（可留空）
+BOOK_NAME = 'YOUR_BOOK_NAME'
+CM_URL = ('https://fanqienovel.com/main/writer/chapter-manage/YOUR_BOOK_ID&'
+          '%E5%B7%85%E5%B3%B0%E8%B5%9B%EF%BC%9A%E6%9D%8E%E7%99%BD%E5%8F%A0%E6%BB%A1'
+          '%E5%BD%A9%E8%89%B2%E6%B5%B7%E5%85%8B%E6%96%AF?type=1')
+START, END = 39, 126
+
+
+def log(s):
+    line = time.strftime('%H:%M:%S') + ' ' + str(s)
+    print(line, flush=True)
+    with LOG.open('a', encoding='utf-8') as f:
+        f.write(line + '\n')
+
+
+def mark(n, status, detail=''):
+    with PROGRESS.open('a', encoding='utf-8') as f:
+        f.write(json.dumps({'ts': time.strftime('%Y-%m-%d %H:%M:%S'),
+                            'chapter': n, 'status': status, 'detail': detail},
+                           ensure_ascii=False) + '\n')
+
+
+def done_set():
+    ok, skip = set(), set()
+    if PROGRESS.exists():
+        for ln in PROGRESS.read_text(encoding='utf-8').splitlines():
+            try:
+                o = json.loads(ln); n = int(o['chapter'])
+                if o.get('status') in ('OK', 'OK_UNVERIFIED'):
+                    ok.add(n)
+                elif o.get('status') == 'SKIP':
+                    skip.add(n)
+            except Exception:
+                pass
+    return ok, skip
+
+
+def chapter_text(n):
+    p = CH_DIR / f'第{n}章.txt'
+    lines = p.read_text(encoding='utf-8').split('\n')
+    title = lines[0].strip()          # 原稿标题，原样使用
+    body = '\n'.join(lines[1:]).strip('\n')
+    return title, body
+
+
+def body_text(page):
+    try:
+        return page.locator('body').inner_text(timeout=8000)
+    except Exception:
+        return ''
+
+
+def btn_texts(page):
+    try:
+        return page.evaluate("""() => Array.from(document.querySelectorAll('button,[role="button"]'))
+            .filter(b => b.getClientRects().length && !b.disabled)
+            .map(b => (b.innerText || '').trim()).filter(Boolean)""")
+    except Exception:
+        return []
+
+
+def word_count(page):
+    m = re.search(r'正文字数\s*(\d+)', body_text(page))
+    return int(m.group(1)) if m else -1
+
+
+def assert_safe(page):
+    url = page.url
+    if OLD_ID in url:
+        raise RuntimeError('检测到《全球AI失智》书号，立即停止：' + url)
+    if ('/publish/' in url or '/chapter-manage/' in url) and BOOK_ID not in url:
+        raise RuntimeError('非巅峰赛作品页面，立即停止：' + url)
+
+
+def click_text(page, text, timeout=10000):
+    loc = page.get_by_role('button', name=text, exact=True)
+    if loc.count() == 0:
+        loc = page.locator('button', has_text=text)
+    if loc.count() == 0:
+        loc = page.get_by_text(text, exact=True)
+    loc.first.wait_for(state='visible', timeout=timeout)
+    loc.first.click(timeout=timeout)
+    log('  点击「%s」' % text)
+
+
+def click_yes(page):
+    ok = page.evaluate("""() => {
+        const els = Array.from(document.querySelectorAll('span,label,div'))
+          .filter(e => e.children.length === 0 && (e.innerText||'').trim() === '是'
+                        && e.getClientRects().length);
+        if (!els.length) return false;
+        els[0].click(); return true;
+    }""")
+    return ok
+
+
+def modal_text(page):
+    try:
+        return page.evaluate("""() => Array.from(document.querySelectorAll(
+            '[class*="modal"],[class*="Modal"],[class*="message"],[class*="Message"]'))
+          .filter(e=>e.getClientRects().length && (e.innerText||'').trim())
+          .map(e=>(e.innerText||'').trim()).join(' || ').slice(0,900)""")
+    except Exception:
+        return ''
+
+
+def drive_dialogs(page, n):
+    """按「弹窗文本 + 按钮文本」双驱动；弹窗文本不在 body.inner_text 里，必须单独读。"""
+    btns, mt = [], ''
+    retried = 0
+    page.wait_for_timeout(1500)   # 等首个弹窗渲染，避免过早重点「下一步」
+    for step in range(34):
+        page.wait_for_timeout(700)
+        btns = btn_texts(page)
+        mt = modal_text(page)
+        if step % 3 == 0:
+            log(f'  弹窗步骤{step}: 按钮={btns[:8]} | 弹窗={mt[:90]!r}')
+
+        if '重复标题' in mt or '请修改后再发布' in mt:
+            raise RuntimeError(f'第{n}章平台拒绝：{mt[:160]}')
+
+        # 1) 发布设置：最终提交，唯一一次
+        if '确认提交' in btns or '发布设置' in mt:
+            if '确认提交' in btns:
+                click_yes(page)
+                click_text(page, '确认提交')
+                return True
+            continue
+        # 2) 内容检测方式
+        if '仅基础检测' in btns or '全面检测' in btns or '内容检测' in mt:
+            if '仅基础检测' in btns:
+                click_text(page, '仅基础检测')
+                continue
+            if '基础检测' in btns:
+                click_text(page, '基础检测')
+                continue
+            continue
+        # 3) 发布提示（错别字）
+        if ('提交' in btns and '取消' in btns) or '发布提示' in mt or '错别字' in mt:
+            if '提交' in btns:
+                click_text(page, '提交')
+                continue
+        # 4) 检测中，等待
+        if '检测' in mt or '稍后' in mt:
+            continue
+        # 5) 已回到章节管理页
+        if '章节管理' in body_text(page) and f'第{n}章' in body_text(page):
+            return True
+        # 6) 仅在完全无弹窗、且已等足够久时，安全重点一次「下一步」
+        core = {b for b in btns if b}
+        if not mt and core and core <= {'存草稿', '下一步'} and retried < 2 and step >= 10:
+            retried += 1
+            try:
+                page.get_by_role('button', name='下一步', exact=True).first.click(timeout=6000)
+                log(f'  安全重点「下一步」({retried}/2)')
+            except Exception:
+                pass
+        page.wait_for_timeout(300)
+    raise RuntimeError(f'第{n}章未走到「确认提交」（按钮={btns[:8]} 弹窗={mt[:160]}）')
+
+
+def publish_one(page, n):
+    title, body = chapter_text(n)
+    local_chars = len(re.sub(r'\s', '', body))
+    log(f'=== 第{n}章《{title}》 本地{local_chars}字 ===')
+    url = f'https://fanqienovel.com/main/writer/{BOOK_ID}/publish/?enter_from=newchapter'
+    page.goto(url, wait_until='domcontentloaded', timeout=45000)
+    assert_safe(page)
+    editor = page.locator('[contenteditable="true"]').first
+    editor.wait_for(state='visible', timeout=30000)
+
+    page.locator('input[type="text"]').first.fill(str(n), timeout=15000)
+    ti = page.locator('input[placeholder="请输入标题"]').first
+    if ti.count() == 0:
+        ti = page.locator('input[type="text"]').nth(1)
+    ti.fill(title, timeout=15000)
+
+    editor.click(timeout=15000)
+    page.keyboard.press('Control+A')
+    page.keyboard.press('Backspace')
+    page.keyboard.type(body, delay=0)      # ProseMirror 只认真实逐字输入
+    page.wait_for_timeout(900)
+    wc = word_count(page)
+    if wc < 1000:
+        log(f'  ⚠ 第{n}章平台字数 {wc} < 1000，跳过不提交')
+        mark(n, 'SKIP', f'平台字数{wc}不足1000')
+        return 'SKIP'
+    log(f'  字段已填：序号={n} 标题={title} 平台正文字数={wc}')
+
+    click_text(page, '下一步')
+    drive_dialogs(page, n)
+
+    # 提交后回章节管理页；新提交的章总在首页，用「第N章」精确核验（不用最大章号，避免假阳性）
+    page.wait_for_timeout(1800)
+    try:
+        page.goto(CM_URL, wait_until='domcontentloaded', timeout=45000)
+        page.wait_for_timeout(1800)
+        ok = f'第{n}章' in body_text(page)
+    except Exception:
+        ok = False
+    if not ok:
+        log(f'  ⚠ 第{n}章提交后首页未立即出现，记待复核（不重提）')
+        mark(n, 'OK_UNVERIFIED', title)
+        return 'OK'
+    log(f'  平台核验通过：章节管理页存在第{n}章')
+    mark(n, 'OK', title)
+    return 'OK'
+
+
+def search_chapter_exists(page, n):
+    try:
+        page.goto(CM_URL, wait_until='domcontentloaded', timeout=45000)
+        page.wait_for_timeout(1600)
+        page.locator('.chapter-search-trigger').first.click(timeout=8000)
+        page.wait_for_timeout(400)
+        inp = page.locator('input[placeholder="输入章节名称或章节号"]').first
+        inp.fill(str(n), timeout=8000)
+        inp.press('Enter')
+        page.wait_for_timeout(1600)
+        return f'第{n}章' in body_text(page)
+    except Exception:
+        return False
+
+
+def wait_login(page, ctx, max_minutes=60):
+    deadline = time.time() + max_minutes * 60
+    i = 0
+    while time.time() < deadline:
+        i += 1
+        try:
+            cookies = ctx.cookies()
+            txt = body_text(page)
+            if len(cookies) > 10 and ('我的小说' in txt or BOOK_NAME in txt):
+                log(f'登录态确认（cookie {len(cookies)} 条）')
+                return True
+        except Exception:
+            pass
+        if i % 3 == 1:
+            page.goto('https://fanqienovel.com/main/writer/book-manage',
+                      wait_until='domcontentloaded', timeout=30000)
+        time.sleep(5)
+    return False
+
+
+def main():
+    PROGRESS.parent.mkdir(parents=True, exist_ok=True)
+    done, skipped = done_set()
+    log(f'启动：目标第{START}-{END}章，已成功 {len(done)}，跳过 {len(skipped)}')
+    with sync_playwright() as pw:
+        ctx = pw.chromium.launch_persistent_context(
+            user_data_dir=str(PROFILE), executable_path=CHROME, headless=False,
+            args=['--disable-blink-features=AutomationControlled', '--no-first-run',
+                  '--no-default-browser-check', '--start-maximized'],
+            viewport=None)
+        ctx.add_init_script("Object.defineProperty(navigator,'webdriver',{get:()=>undefined})")
+        page = ctx.pages[0] if ctx.pages else ctx.new_page()
+        page.goto('https://fanqienovel.com/main/writer/book-manage',
+                  wait_until='domcontentloaded', timeout=45000)
+        if not wait_login(page, ctx):
+            log('登录失败，退出'); ctx.close(); return
+
+        # 启动前翻页核对平台已有章号（避免重复提交）
+        try:
+            page.goto(CM_URL, wait_until='domcontentloaded', timeout=45000)
+            page.wait_for_timeout(2000)
+            existing = set()
+            for pg in range(1, 12):
+                existing |= {int(x) for x in re.findall(r'第(\d+)章', body_text(page))}
+                moved = page.evaluate("""() => {const items=Array.from(document.querySelectorAll('[class*="pagination"] li'));
+                  const a=items.findIndex(e=>(e.className||'').includes('active'));
+                  if(a>=0&&items[a+1]&&!(items[a+1].className||'').includes('disabled')){items[a+1].click();return true;}return false;}""")
+                if not moved: break
+                page.wait_for_timeout(1300)
+            new = {x for x in existing if START <= x <= END}
+            if new:
+                log(f'平台已存在待发范围章号：{sorted(new)}，加入跳过')
+                for x in new:
+                    if x not in done: mark(x, 'OK', '平台已存在（启动核对）')
+                done |= new
+            log(f'平台核对：最大章号 {max(existing) if existing else 0}')
+        except Exception as e:
+            log('启动核对异常（按本地进度继续）：' + repr(e)[:100])
+
+        for n in range(START, END + 1):
+            if n in done or n in skipped:
+                continue
+            try:
+                r = publish_one(page, n)
+                if r == 'SKIP': skipped.add(n)
+                else: done.add(n)
+                handled = len([x for x in (done | skipped) if START <= x <= END])
+                log(f'进度 {handled}/{END-START+1} = {handled/(END-START+1)*100:.1f}% '
+                    f'| 已发布 {len(done)+38}/126 | 跳过 {len(skipped)}')
+            except Exception as e:
+                log(f'!! 第{n}章失败，立即停止：{repr(e)}')
+                log(traceback.format_exc()[-700:])
+                mark(n, 'ERROR', repr(e)[:200])
+                break
+        ctx.close()
+    log(f'脚本结束：已发布 {len(done)} 章，跳过 {len(skipped)} 章')
+
+
+if __name__ == '__main__':
+    main()
